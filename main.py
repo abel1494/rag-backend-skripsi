@@ -1,151 +1,159 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
 from groq import Groq
 from pypdf import PdfReader
 from docx import Document
 from pptx import Presentation
-from typing import List
-from typing_extensions import Annotated
+from typing import List, Optional
 import os
 import json
-import random
+import requests
+import io
 from supabase import create_client
+from dotenv import load_dotenv
+from datetime import datetime, timezone
 
-SUPABASE_URL = "https://pzhvqafnidrgiqklolvf.supabase.co"
-SUPABASE_KEY = "sb_publishable_wBjGZ9KvjI2VnBqupse_Qw_At4oflxF"
+load_dotenv(dotenv_path=env_path)
+
+# Config
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# print("Cek URL Supabase:", SUPABASE_URL)
+
+ML_API = "https://alsyabella-ml-rag-skripsi.hf.space"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
+timeout=60.0 
 
-# Setup App
-app = FastAPI(openapi_version="3.0.3")
-print("OPENAPI VERSION:", app.openapi_version)
-os.makedirs("uploads", exist_ok=True)
+app = FastAPI()
 
-# Setup RAG Components
-model = SentenceTransformer("all-MiniLM-L6-v2")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-chroma_client = chromadb.Client(Settings(
-    persist_directory="./vectorstore",
-    is_persistent=True
-))
+# ML integration
+def get_embedding(text):
+    try:
+        res = requests.post(f"{ML_API}/embed", json={"text": text}, timeout=30)
+        return res.json()["embedding"]
+    except:
+        return [0.0] * 384
 
-collection = chroma_client.get_or_create_collection("documents")
+def get_similarity(text1, text2):
+    try:
+        res = requests.post(f"{ML_API}/similarity", json={
+            "text1": text1,
+            "text2": text2
+        }, timeout=30)
+        return res.json()["similarity"]
+    except:
+        return 0.0
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-# Utility Functions
-def extract_text_from_file(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    text_content = ""
+def extract_pages_from_bytes(file_bytes: bytes, filename: str):
+    ext = os.path.splitext(filename)[1].lower()
+    pages_data = [] 
+    file_stream = io.BytesIO(file_bytes)
 
     if ext == ".pdf":
-        reader = PdfReader(file_path)
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                text_content += text + "\n"
+        reader = PdfReader(file_stream)
+        for i, page in enumerate(reader.pages):
+            extracted = page.extract_text()
+            if extracted:
+                pages_data.append({"location": f"Halaman {i+1}", "text": extracted})
 
     elif ext == ".docx":
-        doc = Document(file_path)
-        for para in doc.paragraphs:
-            text_content += para.text + "\n"
+        doc = Document(file_stream)
+        full_text = "\n".join([para.text for para in doc.paragraphs])
+        pages_data.append({"location": "Dokumen", "text": full_text})
 
     elif ext == ".pptx":
-        prs = Presentation(file_path)
-        for slide in prs.slides:
+        prs = Presentation(file_stream)
+        for i, slide in enumerate(prs.slides):
+            slide_text = ""
             for shape in slide.shapes:
                 if hasattr(shape, "text_frame") and shape.text_frame:
                     for paragraph in shape.text_frame.paragraphs:
                         for run in paragraph.runs:
-                            text_content += run.text + "\n"
+                            slide_text += run.text + "\n"
+            if slide_text.strip():
+                pages_data.append({"location": f"Slide {i+1}", "text": slide_text})
 
-    else:
-        raise ValueError("Format file tidak didukung")
-
-    return text_content
-
+    return pages_data
 
 def chunk_text(text, chunk_size=800):
-    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
-
-
-def ingest_file(file_path, user_id):
-    text = extract_text_from_file(file_path)
-    chunks = chunk_text(text)
+    words = text.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
     
-    file_name = os.path.basename(file_path)
-    collection.delete(where={"file_name": file_name})
+    for word in words:
+        if current_length + len(word) + 1 > chunk_size and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_length = len(word)
+        else:
+            current_chunk.append(word)
+            current_length += len(word) + 1
+            
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+        
+    return chunks
 
-    for i, chunk in enumerate(chunks):
-        if chunk.strip():
-            embedding = model.encode(chunk).tolist()
+def ingest_file(file_bytes, file_name, user_id):
+    pages_data = extract_pages_from_bytes(file_bytes, file_name)
 
-            collection.add(
-                documents=[chunk],
-                embeddings=[embedding],
-                metadatas=[{
+    supabase.table("documents") \
+        .delete() \
+        .eq("file_name", file_name) \
+        .eq("user_id", user_id) \
+        .execute()
+
+    data_to_insert = []
+    for page_item in pages_data:
+        location = page_item["location"]
+        text = page_item["text"]
+        
+        chunks = chunk_text(text)
+        
+        for chunk in chunks:
+            if chunk.strip():
+                embedding = get_embedding(chunk)
+                content_with_location = f"[{location}] {chunk}"
+                
+                data_to_insert.append({
+                    "user_id": user_id,
                     "file_name": file_name,
-                    "chunk_index": i,
-                    "user_id": user_id
-                }],
-                ids=[f"{file_name}_{i}"]
-            )
+                    "content": content_with_location, 
+                    "embedding": embedding
+                })
 
-    return text
+    if data_to_insert:
+        supabase.table("documents").insert(data_to_insert).execute()
 
-def generate_summary_from_text(text):
-    max_chars = 6000  # sedikit lebih panjang
-    text_for_summary = text[:max_chars]
+    return True
 
-    prompt = f"""
-Buat ringkasan komprehensif 2–3 paragraf dari dokumen berikut.
-Gunakan bahasa akademik yang formal dan jelas.
-Fokus pada inti pembahasan utama dan tujuan dokumen.
-Langsung tuliskan saja hasil ringkasannya.
 
-{text_for_summary}
-"""
-
-    response = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama-3.1-8b-instant",
-    )
-
-    return response.choices[0].message.content
-
-def shuffle_options(quiz):
-    for q in quiz:
-        if "options" in q:
-            correct_answer = q["answer"]
-
-            correct_index = ord(correct_answer) - ord('A')
-            options = q["options"]
-            correct_text = options[correct_index]
-
-            random.shuffle(options)
-
-            new_index = options.index(correct_text)
-
-            q["answer"] = chr(ord('A') + new_index)
-            q["options"] = options
-
-    return quiz
-
-# Request Schema
+# Schema
 class QuestionRequest(BaseModel):
     question: str
-    file_name: str | None = None
+    file_name: Optional[List[str]] = None  
     user_id: str
     session_id: str
 
 class QuizRequest(BaseModel):
-    file_name: str
+    file_name: Optional[List[str]] = None 
     user_id: str
     num_questions: int = 5
-    question_type: str = "mcq"
+    quiz_type: str
 
 class AnswerCheckRequest(BaseModel):
     question_id: int
@@ -153,6 +161,14 @@ class AnswerCheckRequest(BaseModel):
     quiz: list
     user_id: str
     file_name: str
+
+class QuizHistoryRequest(BaseModel):
+    user_id: str
+    session_id: str
+    quiz_type: str
+    num_questions: int
+    score: int
+    review_data: list = []
 
 class RegisterRequest(BaseModel):
     email: str
@@ -162,21 +178,18 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
-# Register Endpoint
+
+# Auth 
 @app.post("/register")
 def register(request: RegisterRequest):
-
-    res = supabase.auth.sign_up({
+    supabase.auth.sign_up({
         "email": request.email,
         "password": request.password
     })
+    return {"message": "Register berhasil"}
 
-    return {"message": "User berhasil register"}
-
-# Login Endpoint
 @app.post("/login")
 def login(request: LoginRequest):
-
     res = supabase.auth.sign_in_with_password({
         "email": request.email,
         "password": request.password
@@ -190,369 +203,302 @@ def login(request: LoginRequest):
         "user_id": res.user.id
     }
 
-# Endpoint Upload
+# New Session
+@app.post("/create-session")
+def create_session(user_id: str):
+    return supabase.table("sessions").insert({
+        "user_id": user_id,
+        "title": "New Chat"
+    }).execute().data
+
+# Semua Session
+@app.get("/sessions")
+def get_sessions(user_id: str):
+    return supabase.table("sessions") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .order("created_at", desc=True) \
+        .execute().data
+
+# Upload
 @app.post("/upload")
 async def upload_files(
-    user_id: str,
-    files: Annotated[List[UploadFile], File(...)]
+    user_id: str = Form(...),
+    files: List[UploadFile] = File(...)
 ):
-
-    combined_text = ""
     file_names = []
 
     for file in files:
-        file_path = f"uploads/{file.filename}"
-
-        with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
+        file_bytes = await file.read()
 
         supabase.table("files").insert({
             "user_id": user_id,
             "file_name": file.filename
         }).execute()
 
-        full_text = ingest_file(file_path, user_id)
-
-        combined_text += "\n\n" + full_text
+        ingest_file(file_bytes, file.filename, user_id)
         file_names.append(file.filename)
 
-    max_chars = 8000
-    text_for_summary = combined_text[:max_chars]
-
-    if len(files) == 1:
-        prompt = f"""
-Buat ringkasan komprehensif 1 paragraf dari dokumen berikut.
-Gunakan bahasa akademik formal.
-Langsung ke inti ringkasan.
-
-{text_for_summary}
-"""
-    else:
-        prompt = f"""
-Berikut adalah beberapa dokumen yang diunggah.
-Buat ringkasan 1 paragraf yang menjelaskan secara umum
-apa tema utama dan kesamaan pembahasan dari dokumen-dokumen ini.
-Langsung ke inti ringkasan.
-
-{text_for_summary}
-"""
-
-    response = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama-3.1-8b-instant",
-    )
-
     return {
-        "message": "File berhasil diunggah",
-        "uploaded_files": file_names,
-        "summary": response.choices[0].message.content
+        "message": "Upload berhasil",
+        "files": file_names
     }
 
-# Chat Endpoint
+# Chat
 @app.post("/chat")
 def chat(request: QuestionRequest):
-
     supabase.table("messages").insert({
         "session_id": request.session_id,
         "role": "user",
         "content": request.question
     }).execute()
 
-    query_embedding = model.encode(request.question).tolist()
+    query_embedding = get_embedding(request.question)
+    res = supabase.rpc("match_documents", {
+        "query_embedding": query_embedding,
+        "match_count": 10, 
+        "user_id_param": request.user_id,
+        "file_names_param": request.file_name
+    }).execute()
 
-    if request.file_name:
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=6,
-            where={
-                "file_name": request.file_name,
-                "user_id": request.user_id
-            }
-        )
-    else:
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=6,
-            where={"user_id": request.user_id}
-        )
+    # sitasi
+    context_texts = []
+    if res.data:
+        for doc in res.data:
+            teks_sumber = f"--- SUMBER DARI FILE: {doc['file_name']} ---\n{doc['content']}"
+            context_texts.append(teks_sumber)
+    context = "\n\n".join(context_texts)
 
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
-
-    context = "\n\n".join(documents)
-
-    prompt = f"""
-Jawab hanya berdasarkan konteks berikut.
-Jika tidak ditemukan dalam konteks, katakan tidak ditemukan.
-
-Konteks:
-{context}
-
-Pertanyaan:
-{request.question}
-"""
-
-    #auto title
-    existing_messages = supabase.table("messages") \
+    # auto title
+    existing = supabase.table("messages") \
         .select("*") \
         .eq("session_id", request.session_id) \
         .execute()
 
-    if len(existing_messages.data) == 1:
-
-        title_prompt = f"""
-Buat judul singkat (maks 5 kata) dari pertanyaan berikut:
-
-"{request.question}"
-
-Jawab hanya judulnya saja tanpa tanda kutip.
-"""
-
-        title_response = groq_client.chat.completions.create(
+    if len(existing.data) == 1:
+        title_prompt = (
+            f"Berikan judul singkat maksimal 3-4 kata untuk topik pertanyaan ini: '{request.question}'. "
+            "WAJIB: Berikan HANYA judulnya saja, tanpa tanda kutip, tanpa kalimat pengantar, tanpa titik di akhir."
+        )
+        
+        title_res = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": title_prompt}],
             model="llama-3.1-8b-instant",
+            temperature=0.3,
         )
+        
+        clean_title = title_res.choices[0].message.content.strip().replace('"', '')
+        
+        supabase.table("sessions").update({
+            "title": clean_title
+        }).eq("id", request.session_id).execute()
 
-        title = title_response.choices[0].message.content.strip()
-
-        supabase.table("sessions") \
-            .update({"title": title}) \
-            .eq("id", request.session_id) \
-            .execute()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Kamu adalah asisten akademik cerdas. Kamu akan diberikan potongan teks dari dokumen. "
+                "Setiap potongan dokumen memiliki label 'SUMBER DARI FILE: [Nama File]' dan di dalam teksnya memuat posisi halamannya seperti '[Halaman X]'. "
+                "Tugasmu: Jawab pertanyaan user BERDASARKAN konteks tersebut secara lengkap dan terstruktur. "
+                "ATURAN SANGAT PENTING: Kamu WAJIB menyertakan sitasi (kutipan sumber beserta halamannya) di akhir setiap kalimat atau paragraf informasi yang kamu berikan. "
+                "Gunakan format seperti ini: (Sumber: [Nama File], [Halaman X]). "
+                "Jika membandingkan dua file atau lebih, sebutkan secara spesifik apa yang ada di file pertama dan apa yang ada di file kedua beserta sitasinya. "
+                "Jika jawabannya tidak ada di dokumen, bilang tidak tahu. JANGAN KELUAR DARI DOKUMEN pokoknya harus yang ada di konteks yang di pilih aja. "
+                "jangan kasih rekomendasi lain, pokoknya kalo ga ada di dokumen jangan di jawab dan memberikan alternatif lain untuk pencarian di web di luar itu menjadi batasan mu.\n\n"
+                f"KONTEKS DOKUMEN:\n{context}"
+            )
+        },
+        {"role": "user", "content": request.question}
+    ]
 
     response = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
+        messages=messages,
         model="llama-3.1-8b-instant",
     )
 
-    response_text = response.choices[0].message.content
+    answer = response.choices[0].message.content
 
+    # Simpan jawaban AI
     supabase.table("messages").insert({
         "session_id": request.session_id,
         "role": "ai",
-        "content": response_text
+        "content": answer
     }).execute()
 
-    sources = []
-    seen = set()
+    return {"answer": answer}
 
-    for meta in metadatas:
-        key = (meta["file_name"], meta["chunk_index"])
-        if key not in seen:
-            seen.add(key)
-            sources.append({
-                "file_name": meta["file_name"],
-                "chunk_index": meta["chunk_index"]
-            })
-
-    return {
-        "answer": response_text,
-        "sources": sources
-    }
-
-# Endpoint Files
+# File 
 @app.get("/files")
 def list_files(user_id: str):
-
-    res = supabase.table("files") \
+    return supabase.table("files") \
         .select("*") \
         .eq("user_id", user_id) \
-        .execute()
+        .execute().data
 
-    return res.data
-
-    all_data = collection.get(include=["metadatas"])
-
-    metadatas = all_data.get("metadatas", [])
-
-    file_counts = {}
-
-    for meta in metadatas:
-        if meta and "file_name" in meta:
-            file_name = meta["file_name"]
-            file_counts[file_name] = file_counts.get(file_name, 0) + 1
-
-    files = []
-
-    for file_name, count in file_counts.items():
-        files.append({
-            "file_name": file_name,
-            "total_chunks": count
-        })
-
-    return files
-
-# endpoint quiz
+# Quiz
 @app.post("/generate-quiz")
 def generate_quiz(request: QuizRequest):
-
-    results = collection.query(
-        query_embeddings=[model.encode("materi utama dokumen").tolist()],
-        n_results=8,
-        where={
-            "file_name": request.file_name,
-            "user_id": request.user_id
-        }
-    )
-
-    documents = results["documents"][0]
-
-    if not documents:
-        return {"error": "File tidak ditemukan atau belum diupload"}
-
-    context = "\n\n".join(documents)
-
-    if request.question_type == "mcq":
-        prompt = f"""
-    Berdasarkan materi berikut, buat {request.num_questions} soal pilihan ganda.
-
-    WAJIB:
-    - Output hanya JSON
-    - Jangan tambahkan penjelasan
-    - Jangan pakai markdown
-
-    Format:
-
-    [
-    {{
-        "question": "...",
-        "options": ["...", "...", "...", "..."],
-        "answer": "A"
-    }}
-    ]
-
-    Materi:
-    {context}
-    """
-    else:
-        prompt = f"""
-    Berdasarkan materi berikut, buat {request.num_questions} soal essay.
-
-    WAJIB:
-    - Output hanya JSON
-    - Jangan tambahkan penjelasan
-
-    Format:
-
-    [
-    {{
-        "question": "...",
-        "answer": "..."
-    }}
-    ]
-
-    Materi:
-    {context}
-    """
-    response = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama-3.1-8b-instant",
-    )
-
-    raw_quiz = response.choices[0].message.content.strip()
-
-    if raw_quiz.startswith("```"):
-        raw_quiz = raw_quiz.replace("```json", "").replace("```", "").strip()
-
-    start = raw_quiz.find("[")
-    end = raw_quiz.rfind("]")
-
-    if start != -1 and end != -1:
-        raw_quiz = raw_quiz[start:end+1]
-
     try:
-        quiz = json.loads(raw_quiz)
+        print(f"--- MEMULAI GENERATE KUIS DARI {len(request.file_name)} FILE ---")
+        
+        all_contexts = []
+        
+        for fname in request.file_name:
+            query_embedding = get_embedding(f"intisari materi penting dari dokumen {fname}")
+            
+            res = supabase.rpc("match_documents", {
+                "query_embedding": query_embedding,
+                "match_count": 8, 
+                "user_id_param": request.user_id,
+                "file_names_param": [fname] 
+            }).execute()
 
-        for i, q in enumerate(quiz):
-            q["id"] = i
+            if res.data:
+                file_context = "\n".join([d["content"] for d in res.data])
+                all_contexts.append(f"--- MATERI DARI {fname} ---\n{file_context}")
 
-    except:
-        return {
-            "error": "Format quiz tidak valid dari LLM",
-            "raw_output": raw_quiz
-        }
+        if not all_contexts:
+            print("ERROR: Konteks tidak ditemukan di semua file")
+            raise HTTPException(status_code=404, detail="Materi dokumen tidak ditemukan")
 
-    if request.question_type == "mcq":
-        quiz = shuffle_options(quiz)
+        context = "\n\n".join(all_contexts)[:8000]
 
-    return {
-        "quiz": quiz
-    }
+        prompt = f"""
+Anda adalah mesin pembuat kuis JSON. Buat persis {request.num_questions} soal {request.quiz_type} dari GABUNGAN MATERI di bawah ini.
+PASTIKAN soal diambil secara merata dari semua dokumen yang ada di materi.
+TIDAK BOLEH ADA TEKS LAIN SELAIN JSON MURNI.
+
+Format WAJIB untuk Essay:
+{{"quiz": [{{"id": 1, "question": "Apa itu X?", "answer": "X adalah..."}}]}}
+
+Format WAJIB untuk Pilihan Ganda (PG):
+{{"quiz": [{{"id": 1, "question": "Apa itu X?", "options": ["A. Y", "B. X", "C. Z", "D. W"], "answer": "B. X"}}]}}
+
+Materi Gabungan:
+{context}
+        """
+
+        response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-8b-instant",
+            response_format={"type": "json_object"}
+        )
+
+        raw_content = response.choices[0].message.content
+        data_json = json.loads(raw_content)
+        quiz_list = data_json.get("quiz", [])
+
+        for i, q in enumerate(quiz_list):
+            q["id"] = i + 1
+
+        return {"quiz": quiz_list}
+
+    except Exception as e:
+        print(f"!!! ERROR GENERATE QUIZ: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Gagal: {str(e)}")
 
 @app.post("/check-answer")
 def check_answer(request: AnswerCheckRequest):
+    q = next((x for x in request.quiz if x["id"] == request.question_id), None)
+    if not q:
+        return {"error": "Soal tidak ditemukan"}
+        
+    correct_answer = str(q["answer"]).strip()
+    user_ans = str(request.user_answer).strip()
 
-    question = next((q for q in request.quiz if q["id"] == request.question_id), None)
+    # Cek PG
+    if "options" in q:
+        if user_ans.lower() == correct_answer.lower():
+            return {
+                "similarity": 100,
+                "feedback": "Jawaban Tepat!",
+                "reference_answer": correct_answer
+            }
+        else:
+            return {
+                "similarity": 0,
+                "feedback": "Jawaban Salah.",
+                "reference_answer": correct_answer
+            }
+    
+    # Cek Essay
+    sim = get_similarity(user_ans, correct_answer)
+    percent = round(sim * 100, 2)
 
-    if not question:
-        return {"error": "Question tidak ditemukan"}
-
-    correct_answer = question["answer"]
-
-    user_embedding = model.encode(request.user_answer)
-    correct_embedding = model.encode(correct_answer)
-
-    similarity = float(
-        (user_embedding @ correct_embedding) /
-        ((user_embedding @ user_embedding) ** 0.5 * (correct_embedding @ correct_embedding) ** 0.5)
-    )
-
-    percentage = round(similarity * 100, 2)
-    score_percent = similarity * 100
-
-    if percentage > 85:
-        feedback = "Jawaban sangat sesuai dengan konteks."
-    elif percentage > 70:
-        feedback = "Jawaban cukup sesuai, namun masih bisa diperbaiki."
-    elif percentage > 50:
-        feedback = "Jawaban kurang tepat, hanya sebagian yang relevan."
-    else:
-        feedback = "Jawaban tidak sesuai dengan konteks."
-
-    supabase.table("quiz_history").insert({
-        "user_id": request.user_id,
-        "file_name": request.file_name,
-        "question": question["question"],
-        "user_answer": request.user_answer,
-        "correct_answer": correct_answer,
-        "similarity": similarity,
-        "feedback": feedback
-    }).execute()
+    feedback = "Tidak sesuai"
+    if percent > 85: feedback = "Sangat sesuai"
+    elif percent > 70: feedback = "Cukup sesuai"
+    elif percent > 50: feedback = "Kurang tepat"
 
     return {
-        "similarity": percentage,
+        "similarity": percent,
         "feedback": feedback,
         "reference_answer": correct_answer
     }
 
-# Endpoint Delete
+# Delete File
 @app.delete("/delete-file")
 def delete_file(file_name: str, user_id: str):
-
-    # Supabase
     supabase.table("files") \
         .delete() \
         .eq("file_name", file_name) \
         .eq("user_id", user_id) \
         .execute()
 
-    # Chroma
-    collection.delete(
-        where={
-            "file_name": file_name,
-            "user_id": user_id
+    supabase.table("documents") \
+        .delete() \
+        .eq("file_name", file_name) \
+        .eq("user_id", user_id) \
+        .execute()
+
+    return {"message": "File dihapus"}
+
+# Chat History
+@app.get("/chat-history")
+def get_chat_history(session_id: str):
+    return supabase.table("messages") \
+        .select("*") \
+        .eq("session_id", session_id) \
+        .order("created_at") \
+        .execute().data
+
+# Quiz History
+@app.get("/quiz-history")
+def get_quiz_history(session_id: str):
+    try:
+        res = supabase.table("quiz_history") \
+            .select("*") \
+            .eq("session_id", session_id) \
+            .order("created_at", desc=True) \
+            .execute()
+        return res.data
+    except Exception as e:
+        print("ERROR GET HISTORY:", e)
+        return []
+
+@app.post("/save-quiz-history")
+def save_quiz_history(request: QuizHistoryRequest):
+    try:
+        data = {
+            "user_id": request.user_id,
+            "session_id": request.session_id,
+            "quiz_type": request.quiz_type,
+            "num_questions": request.num_questions,
+            "score": request.score,
+            "review_data": request.review_data
         }
-    )
+        res = supabase.table("quiz_history").insert(data).execute()
+        return {"status": "success", "data": res.data}
+    except Exception as e:
+        print("ERROR SAVE HISTORY:", e)
+        return {"error": str(e)}
 
-    return {"message": "File berhasil dihapus"}
-
-# Endpoint Session Baru
-@app.post("/create-session")
-def create_session(user_id: str, title: str = "New Chat"):
-
-    res = supabase.table("sessions").insert({
-        "user_id": user_id,
-        "title": title
-    }).execute()
-
-    return res.data
+@app.post("/update-session-time")
+def update_session_time(session_id: str):
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        res = supabase.table("sessions").update({"updated_at": now}).eq("id", session_id).execute()
+        return {"status": "success"}
+    except Exception as e:
+        print("ERROR UPDATE WAKTU:", e)
+        return {"error": str(e)}
