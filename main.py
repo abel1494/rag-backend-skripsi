@@ -39,6 +39,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/api/hello")
+def hello():
+    return {"status": "Backend nyala, Bella!"}
+
 # ML integration
 def get_embedding(text):
     try:
