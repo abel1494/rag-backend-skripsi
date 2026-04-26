@@ -14,7 +14,7 @@ from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 
-load_dotenv(dotenv_path=env_path)
+load_dotenv()
 
 # Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
