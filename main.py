@@ -41,11 +41,15 @@ app.add_middleware(
 )
 
 @app.options("/{rest_of_path:path}")
-async def preflight_handler(rest_of_path: str, response: Response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS, DELETE, PUT"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-    return Response(status_code=200) 
+async def preflight_handler(rest_of_path: str):
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, GET, OPTIONS, DELETE, PUT",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+    ) 
     
 # ML integration
 def get_embedding(text):
