@@ -27,22 +27,20 @@ ML_API = "https://alsyabella-ml-rag-skripsi.hf.space"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
-timeout=60.0 
+timeout=60.0
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=[
+        "https://skripsi-rag-academic-assistent-syst.vercel.app",
+        "http://localhost:3000"
+    ], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.get("/api/hello")
-def hello():
-    return {"status": "Backend nyala, Bella!"}
-
 # ML integration
 def get_embedding(text):
     try:
@@ -250,7 +248,7 @@ async def upload_files(
 
 # Chat
 @app.post("/chat")
-def chat(request: QuestionRequest):
+async def chat(request: QuestionRequest):
     supabase.table("messages").insert({
         "session_id": request.session_id,
         "role": "user",
