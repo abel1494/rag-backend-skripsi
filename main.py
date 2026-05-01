@@ -316,7 +316,8 @@ async def chat(request: QuestionRequest):
                 "Gunakan format seperti ini: (Sumber: [Nama File], [Halaman X]). "
                 "Jika membandingkan dua file atau lebih, sebutkan secara spesifik apa yang ada di file pertama dan apa yang ada di file kedua beserta sitasinya. "
                 "Jika jawabannya tidak ada di dokumen, bilang tidak tahu. JANGAN KELUAR DARI DOKUMEN pokoknya harus yang ada di konteks yang di pilih aja. "
-                "jangan kasih rekomendasi lain, pokoknya kalo ga ada di dokumen jangan di jawab dan memberikan alternatif lain untuk pencarian di web di luar itu menjadi batasan mu.\n\n"
+                "JANGAN MENAWARKAN UNTUK MENCARI DI LUAR KOTEKS SEPERTI INTERNET."
+                "jangan kasih rekomendasi lain, pokoknya kalo ga ada di dokumen jangan di jawab dan jangan memberikan alternatif lain untuk pencarian di web di luar itu menjadi batasan mu.\n\n"
                 f"KONTEKS DOKUMEN:\n{context}"
             )
         },
