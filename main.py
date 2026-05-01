@@ -273,7 +273,7 @@ async def chat(request: QuestionRequest):
         "file_names_param": request.file_name
     }).execute()
 
-    # sitasi
+    # Sitasi
     context_texts = []
     if res.data:
         for doc in res.data:
@@ -291,10 +291,9 @@ async def chat(request: QuestionRequest):
                 "ATURAN SANGAT PENTING: Kamu WAJIB menyertakan sitasi (kutipan sumber beserta halamannya) di akhir setiap kalimat atau paragraf informasi yang kamu berikan. "
                 "Gunakan format seperti ini: (Sumber: [Nama File], [Halaman X]). "
                 "Jika membandingkan dua file atau lebih, sebutkan secara spesifik apa yang ada di file pertama dan apa yang ada di file kedua beserta sitasinya. "
-                "Jika jawabannya tidak ada di dokumen, bilang tidak tahu. JANGAN KELUAR DARI DOKUMEN pokoknya harus yang ada di konteks yang di pilih aja. "
-                "JANGAN MENAWARKAN UNTUK MENCARI DI LUAR KOTEKS SEPERTI INTERNET."
-                "jangan kasih rekomendasi lain, pokoknya kalo ga ada di dokumen jangan di jawab dan jangan memberikan alternatif lain untuk pencarian di web di luar itu menjadi batasan mu.\n\n"
-                f"KONTEKS DOKUMEN:\n{context}"
+                "Jika jawabannya tidak ada di dokumen, bilang tidak tahu. JANGAN KELUAR DARI DOKUMEN. "
+                "JANGAN MENAWARKAN UNTUK MENCARI DI LUAR KONTEKS SEPERTI INTERNET."
+                f"\n\nKONTEKS DOKUMEN:\n{context}"
             )
         },
         {"role": "user", "content": request.question}
@@ -307,48 +306,44 @@ async def chat(request: QuestionRequest):
 
     answer = response.choices[0].message.content
 
-    # Auto Title
-    if ai_answer:
-        existing = supabase.table("messages") \
-            .select("id") \
-            .eq("session_id", request.session_id) \
-            .execute()
-        
-        if len(existing.data) <= 2:
-            try:
-                title_prompt = (
-                    f"Buat judul maksimal 4 kata dari teks ini: '{ai_answer}'. "
-                    "WAJIB: Berikan HANYA judulnya saja, tanpa tanda kutip, pengantar, atau titik."
-                )
-                
-                title_res = groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": title_prompt}],
-                    model="llama-3.1-8b-instant",
-                    temperature=0.1, 
-                )
-                
-                clean_title = title_res.choices[0].message.content.strip().replace('"', '')
-                
-                supabase.table("sessions").update({
-                    "title": clean_title
-                }).eq("id", request.session_id).execute()
-                
-                print(f"Auto-title berhasil: {clean_title}")
-
-            except Exception as e:
-                print(f"Gagal generate title (Logika Dilewati): {e}")
-
-    return {"answer": ai_answer}
-
-    # Simpan jawaban AI
     supabase.table("messages").insert({
         "session_id": request.session_id,
         "role": "ai",
         "content": answer
     }).execute()
 
-    return {"answer": answer}
+    # Auto tittle
+    try:
+        existing = supabase.table("messages") \
+            .select("id") \
+            .eq("session_id", request.session_id) \
+            .execute()
+        
+        if len(existing.data) <= 2:
+            title_prompt = (
+                f"Buat judul maksimal 4 kata dari teks ini: '{answer}'. "
+                "WAJIB: Berikan HANYA judulnya saja, tanpa tanda kutip, pengantar, atau titik."
+            )
+            
+            title_res = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": title_prompt}],
+                model="llama-3.1-8b-instant",
+                temperature=0.1, 
+            )
+            
+            clean_title = title_res.choices[0].message.content.strip().replace('"', '')
+            
+            supabase.table("sessions").update({
+                "title": clean_title
+            }).eq("id", request.session_id).execute()
+            
+            print(f"Auto-title berhasil: {clean_title}")
 
+    except Exception as e:
+        print(f"Gagal generate title (Logika Dilewati): {e}")
+
+    return {"answer": answer}
+    
 # File 
 @app.get("/files")
 def list_files(user_id: str):
