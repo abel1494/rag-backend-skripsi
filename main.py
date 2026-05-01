@@ -281,29 +281,33 @@ async def chat(request: QuestionRequest):
             context_texts.append(teks_sumber)
     context = "\n\n".join(context_texts)
 
-    # auto title
+    #auto title
     existing = supabase.table("messages") \
         .select("*") \
         .eq("session_id", request.session_id) \
         .execute()
-
-    if len(existing.data) == 1:
+    
+    if len(existing.data) <= 2:
         title_prompt = (
-            f"Berikan judul singkat maksimal 3-4 kata untuk topik pertanyaan ini: '{request.question}'. "
-            "WAJIB: Berikan HANYA judulnya saja, tanpa tanda kutip, tanpa kalimat pengantar, tanpa titik di akhir."
+            f"Simpulkan jawaban ini menjadi judul topik maksimal 4 kata: '{ai_answer}'. "
+            "WAJIB: Berikan HANYA judulnya saja, tanpa tanda kutip, tanpa kalimat pengantar, tanpa titik."
         )
         
-        title_res = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": title_prompt}],
-            model="llama-3.1-8b-instant",
-            temperature=0.3,
-        )
-        
-        clean_title = title_res.choices[0].message.content.strip().replace('"', '')
-        
-        supabase.table("sessions").update({
-            "title": clean_title
-        }).eq("id", request.session_id).execute()
+        try:
+            title_res = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": title_prompt}],
+                model="llama-3.1-8b-instant",
+                temperature=0.3,
+            )
+            
+            clean_title = title_res.choices[0].message.content.strip().replace('"', '')
+            
+            supabase.table("sessions").update({
+                "title": clean_title
+            }).eq("id", request.session_id).execute()
+            
+        except Exception as e:
+            print(f"Gagal generate title: {e}")
 
     messages = [
         {
