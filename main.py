@@ -281,34 +281,6 @@ async def chat(request: QuestionRequest):
             context_texts.append(teks_sumber)
     context = "\n\n".join(context_texts)
 
-    #auto title
-    existing = supabase.table("messages") \
-        .select("*") \
-        .eq("session_id", request.session_id) \
-        .execute()
-    
-    if len(existing.data) <= 2:
-        title_prompt = (
-            f"Simpulkan jawaban ini menjadi judul topik maksimal 4 kata: '{ai_answer}'. "
-            "WAJIB: Berikan HANYA judulnya saja, tanpa tanda kutip, tanpa kalimat pengantar, tanpa titik."
-        )
-        
-        try:
-            title_res = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": title_prompt}],
-                model="llama-3.1-8b-instant",
-                temperature=0.3,
-            )
-            
-            clean_title = title_res.choices[0].message.content.strip().replace('"', '')
-            
-            supabase.table("sessions").update({
-                "title": clean_title
-            }).eq("id", request.session_id).execute()
-            
-        except Exception as e:
-            print(f"Gagal generate title: {e}")
-
     messages = [
         {
             "role": "system",
@@ -334,6 +306,39 @@ async def chat(request: QuestionRequest):
     )
 
     answer = response.choices[0].message.content
+
+    # Auto Title
+    if ai_answer:
+        existing = supabase.table("messages") \
+            .select("id") \
+            .eq("session_id", request.session_id) \
+            .execute()
+        
+        if len(existing.data) <= 2:
+            try:
+                title_prompt = (
+                    f"Buat judul maksimal 4 kata dari teks ini: '{ai_answer}'. "
+                    "WAJIB: Berikan HANYA judulnya saja, tanpa tanda kutip, pengantar, atau titik."
+                )
+                
+                title_res = groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": title_prompt}],
+                    model="llama-3.1-8b-instant",
+                    temperature=0.1, 
+                )
+                
+                clean_title = title_res.choices[0].message.content.strip().replace('"', '')
+                
+                supabase.table("sessions").update({
+                    "title": clean_title
+                }).eq("id", request.session_id).execute()
+                
+                print(f"Auto-title berhasil: {clean_title}")
+
+            except Exception as e:
+                print(f"Gagal generate title (Logika Dilewati): {e}")
+
+    return {"answer": ai_answer}
 
     # Simpan jawaban AI
     supabase.table("messages").insert({
