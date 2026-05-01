@@ -527,3 +527,15 @@ def update_session_time(session_id: str):
     except Exception as e:
         print("ERROR UPDATE WAKTU:", e)
         return {"error": str(e)}
+
+# Delete Session
+@app.delete("/delete-session")
+def delete_session(request: dict):
+    session_id = request.get("session_id")
+    
+    if not session_id:
+        return {"status": "error", "message": "Session ID is required"}
+
+    result = supabase.table("sessions").delete().eq("id", session_id).execute()
+    
+    return {"status": "success", "data": result.data}
