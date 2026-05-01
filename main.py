@@ -217,12 +217,16 @@ def login(request: LoginRequest):
 
 # New Session
 @app.post("/create-session")
-def create_session(user_id: str):
+def create_session(request: dict):
+    user_id = request.get("user_id")
+    session_id = request.get("session_id") 
+    
     return supabase.table("sessions").insert({
+        "id": session_id, 
         "user_id": user_id,
-        "title": "New Chat"
+        "title": "New Chat" 
     }).execute().data
-
+    
 # Semua Session
 @app.get("/sessions")
 def get_sessions(user_id: str):
